@@ -81,7 +81,7 @@ uint8_t END_TAG[4] = "LAST"; // Additional Data (tag) for the last chunk.
 
 // Error codes used in this program.
 enum error {
-    ERR_OK,
+    ERR_OK = 0,
     ERR_KEYFILE,
     ERR_INPUT_FILE,
     ERR_OUTPUT_FILE,
@@ -96,6 +96,7 @@ enum error {
     ERR_VERSION_MISMATCH,
     ERR_UID,
     ERR_UID_TOO_BIG,
+    ERR_USAGE,
 };
 
 // Error messages associated with the error codes above.
@@ -107,7 +108,7 @@ static const char *errmsg[] = {
     [ERR_READ] = "Input error",
     [ERR_WRITE] = "Output error",
     [ERR_INVALID] = "Wrong passphrase / bad input",
-    [ERR_NO_RANDOM] = "Could not fill a random buffer",
+    [ERR_NO_RANDOM] = "Could not get enough entropy to function",
     [ERR_NO_KEY] = "Could not generate an encryption key",
     [ERR_PASS_READ_FAIL] = "Failed to read passphrase",
     [ERR_PASS_TOO_BIG] = "Passphrases must be less than 255 bytes",
@@ -115,15 +116,18 @@ static const char *errmsg[] = {
     [ERR_VERSION_MISMATCH] = "Version mismatch",
     [ERR_UID] = "UID missing",
     [ERR_UID_TOO_BIG] = "UID must be less than 255 bytes",
+    [ERR_USAGE] = "Use -h (or --help) for usage.",
 };
 
 // Operation modes of the program.
 enum operation {
-  MODE_NONE,
-  MODE_ENCRYPT,
-  MODE_DECRYPT,
-  MODE_KEYGEN,
-  MODE_KEYEDIT,
+    MODE_NONE       = 1 << 0,
+    MODE_ENCRYPT    = 1 << 1,
+    MODE_DECRYPT    = 1 << 2,
+    MODE_KEYGEN     = 1 << 3,
+    MODE_KEYEDIT    = 1 << 4,
+    MODE_USAGE      = 1 << 5,
+    MODE_VERSION    = 1 << 6,
 };
 
 // Configuration structure for the 'get_passphrase()' function.
@@ -140,11 +144,6 @@ struct passphrase_config {
 // mode. This array (kind of a map) is used by 'get_passphrase()' to behave
 // differently depending on the mode by which it is called.
 static const struct passphrase_config passphrase_configs[] = {
-    [MODE_NONE] = {
-        .prompt = "",
-        .prompt_repeat = "",
-        .confirm = 0
-    },
     [MODE_ENCRYPT] = {
         .prompt = "passphrase:",
         .prompt_repeat = "passphrase (repeat):",
@@ -165,6 +164,26 @@ static const struct passphrase_config passphrase_configs[] = {
         .prompt_repeat = "protection passphrase (repeat):",
         .confirm = 1
     },
+};
+
+// Default key derivation configuration for gen_key.
+// This configuration will be used by default, when the ser does not specify a
+// configutaion for password-based key generation.
+static const crypto_argon2_config gen_key_config = {
+    .algorithm = CRYPTO_ARGON2_I,
+    .nb_blocks = ARGON_NB_BLOCKS,
+    .nb_passes = ARGON_NB_ITERATIONS,
+    .nb_lanes  = ARGON_NB_LANES
+};
+
+// Default key derication extras (for Argon2i). For now, our gen_key function
+// doesn't need a 'key' or an 'ad', and thus uses this default struct for
+// defaults.
+static const crypto_argon2_extras gen_key_extras = {
+    .key = NULL,
+    .key_size = 0,
+    .ad = NULL,
+    .ad_size  = 0
 };
 
 // Usage text displayed with the option '-h' (--help).
@@ -222,6 +241,14 @@ static enum error encrypt(FILE *in, FILE *out, const uint8_t key[KEY_SIZE],
     uint8_t buf_in[CHUNKLEN];
     uint8_t buf_out[CHUNKLEN + MAC_SIZE];
 
+    if (!in) {
+        BAIL(ERR_INPUT_FILE);
+    }
+
+    if (!out) {
+        BAIL(ERR_OUTPUT_FILE);
+    }
+
     crypto_aead_ctx ctx;
     crypto_aead_init_x(&ctx, key, nonce);
 
@@ -251,6 +278,7 @@ static enum error encrypt(FILE *in, FILE *out, const uint8_t key[KEY_SIZE],
         }
     } while(!eof);
 
+bail:
     crypto_wipe(&ctx, sizeof(ctx)); // securely wipe the context.
     crypto_wipe(buf_in, CHUNKLEN); // securely wipe the buf_in.
     return err;
@@ -266,6 +294,14 @@ static enum error decrypt(FILE *in, FILE *out, const uint8_t key[KEY_SIZE],
 
     uint8_t buf_out[CHUNKLEN];
     uint8_t buf_in[CHUNKLEN + MAC_SIZE];
+
+    if (!in) {
+        BAIL(ERR_INPUT_FILE);
+    }
+
+    if (!out) {
+        BAIL(ERR_OUTPUT_FILE);
+    }
 
     crypto_aead_ctx ctx;
     crypto_aead_init_x(&ctx, key, nonce);
@@ -300,16 +336,21 @@ static enum error decrypt(FILE *in, FILE *out, const uint8_t key[KEY_SIZE],
         }
     } while(!eof);
 
+bail:
     crypto_wipe(&ctx, sizeof(ctx)); // securely wipe the context.
     crypto_wipe(buf_out, CHUNKLEN); // securely wipe the buf_out.
     return err;
 }
 
-// Generate a KEY_SIZE bytes key from a passphrase and a salt (random)
-// using Argon2i. This needs a work area that has to be allocated.
-// If this allocation fails, securely wipe the passphrase and exit.
-static enum error gen_key(uint8_t *passphrase, size_t passphrase_size,
-                          uint8_t *salt, uint8_t key[KEY_SIZE])
+// Generate a key_size bytes key from a passphrase and a salt (random)
+// using Argon2i (with configuration in 'config', inputs (password and salt) 
+// data in 'inputs'), and extras (key and ad). This needs a work area that
+// has to be allocated. If this allocation fails, securely wipe inputs and
+// extras and exit.
+static enum error gen_key(crypto_argon2_config config,
+                          crypto_argon2_inputs inputs,
+                          crypto_argon2_extras extras,
+                          size_t key_size, uint8_t *key)
 {
     enum error err = ERR_OK;
     void *work_area = malloc(ARGON_NB_BLOCKS * 1024);
@@ -319,35 +360,11 @@ static enum error gen_key(uint8_t *passphrase, size_t passphrase_size,
         BAIL(ERR_NO_KEY);
     }
 
-    crypto_argon2_config cfg = {
-        .algorithm = CRYPTO_ARGON2_I,
-        .nb_blocks = ARGON_NB_BLOCKS,
-        .nb_passes = ARGON_NB_ITERATIONS,
-        .nb_lanes  = ARGON_NB_LANES
-    };
-
-    crypto_argon2_inputs inputs = {
-        .pass = passphrase,
-        .salt = salt, 
-        .pass_size = passphrase_size,
-        .salt_size = ARGON_SALT_SIZE 
-    };
-
-    crypto_argon2_extras extras = {
-        .key = NULL,
-        .ad = NULL,
-        .key_size = 0,
-        .ad_size = 0
-    };
-
-    crypto_argon2(key, KEY_SIZE, work_area, cfg, inputs, extras);
-
+    crypto_argon2(key, key_size, work_area, config, inputs, extras);
     free(work_area);
-    crypto_wipe(&cfg, sizeof(crypto_argon2_config));
+bail:
     crypto_wipe(&inputs, sizeof(crypto_argon2_inputs));
     crypto_wipe(&extras, sizeof(crypto_argon2_extras));
-bail:
-    crypto_wipe(passphrase, passphrase_size);
     return err;
 }
 
@@ -369,11 +386,13 @@ static enum error get_passphrase(uint8_t *passphrase, size_t size, int *len,
     if (r0 < 0) {
         BAIL(ERR_PASS_TOO_BIG);
     }
+    // If no protection is needed, do not ask for a confirmation.
+    if ((mode == MODE_KEYEDIT) && (!passphrase[0])) {
+        *len = r0;
+        return ERR_OK;
+    }
+    // Otherwise, ask for a confirmattion if needed.
     if (config.confirm) {
-        // If no protection is needed, do not ask for a confirmation.
-        if ((mode == MODE_KEYEDIT) && (!passphrase[0])) {
-            BAIL(ERR_OK);
-        }
         uint8_t tmp[MAXPASS];
         int r1 = read_password(tmp, sizeof(tmp), config.prompt_repeat);
         if (r1 == 0) {
@@ -403,8 +422,12 @@ static enum error read_keyfile(FILE *kf, uint8_t key[KEY_SIZE])
     enum error err = ERR_OK;
     uint8_t content[KEYFILE_SIZE];
     uint8_t passphrase[MAXPASS];
-    uint8_t prot_key[KEY_SIZE];
+    uint8_t pkey[KEY_SIZE];
     int pwlen = 0;
+
+    if (!kf) {
+        BAIL(ERR_INPUT_FILE);
+    }
 
     size_t len = read_bytes(kf, content, KEYFILE_SIZE);
     if ((len != KEYFILE_SIZE) || ferror(kf)) {
@@ -422,12 +445,11 @@ static enum error read_keyfile(FILE *kf, uint8_t key[KEY_SIZE])
     uint8_t *version = mac + MAC_SIZE;
     uint8_t *fkey = version + 1;
 
-    // Inspect the protection-version byte
-    int protected = *version & 0xFF;
+    // Inspect the protection-version byte, and get its MSB.
+    int protected = *version >> 7;
     if (!protected) {
         // Key is not protected. Copy the last KEY_SIZE bytes. 
         memcpy(key, fkey, KEY_SIZE);
-        BAIL(ERR_OK);
     } else {
         // Ask the user to provide a passphrase to decrypt the key.
         err = get_passphrase(passphrase, MAXPASS, &pwlen, MODE_DECRYPT);
@@ -435,19 +457,25 @@ static enum error read_keyfile(FILE *kf, uint8_t key[KEY_SIZE])
             BAIL(err);
         }
         // Generate the protection key using this passphrase and the nonce.
-        err = gen_key(passphrase, pwlen, nonce, prot_key);
+        crypto_argon2_inputs inputs = {
+            .pass = passphrase,
+            .pass_size = pwlen,
+            .salt = nonce,
+            .salt_size = ARGON_SALT_SIZE
+        };
+        err = gen_key(gen_key_config, inputs, gen_key_extras, KEY_SIZE, pkey);
         if (err != ERR_OK) {
             BAIL(err);
         }
         // Decrypt the key in the file (i.e., 'fkey') into 'key'.
         // If it fails, bail out.
-        if (crypto_aead_unlock(key, mac, prot_key, nonce, NULL, 0, fkey,
+        if (crypto_aead_unlock(key, mac, pkey, nonce, NULL, 0, fkey,
                                KEY_SIZE) < 0) {
             BAIL(ERR_INVALID);
         }
     }
 bail: // Clear sensitive data, and return err.
-    crypto_wipe(prot_key, sizeof(prot_key));
+    crypto_wipe(pkey, sizeof(pkey));
     crypto_wipe(passphrase, sizeof(passphrase));
     return err;
 }
@@ -460,7 +488,7 @@ bail: // Clear sensitive data, and return err.
 // last KEY_SIZE bytes of 'content'.
 // 2) if the passphrase is not empty, then:
 // 2-a) We set the 'protection bit' to '1'.
-// 2-b) We generate an encryption key (prot_key) using the given passphrase and
+// 2-b) We generate an encryption key (pkey) using the given passphrase and
 // the 'nonce' (first NONCE_SIZE bytes of 'content'), and encrypt the provided
 // key 'key' and put the encrypted key in the last KEY_SIZE bytes of 'content'.
 // 3) We write the 'content' to 'kf'.
@@ -469,8 +497,12 @@ static enum error write_keyfile(FILE *kf, uint8_t key[KEY_SIZE])
     enum error err = ERR_OK;
     uint8_t content[KEYFILE_SIZE];
     uint8_t passphrase[MAXPASS]; // Key protection passphrase.
-    uint8_t prot_key[KEY_SIZE];
+    uint8_t pkey[KEY_SIZE];
     int pwlen = 0; // Length of protection passphrase.
+
+    if (!kf) {
+        BAIL(ERR_OUTPUT_FILE);
+    }
 
     // Some pointers according to this keyfile format:
     // +----------------+------------+----------------------+-------------+
@@ -500,12 +532,18 @@ static enum error write_keyfile(FILE *kf, uint8_t key[KEY_SIZE])
         *version = 0x80 | KEYFILE_VERSION;
         // Generate an encryption key (for the given key) using the passphrase
         // and the nonce (located at the beginning of 'content').
-        err = gen_key(passphrase, pwlen, nonce, prot_key);
+        crypto_argon2_inputs inputs = {
+            .pass = passphrase,
+            .pass_size = pwlen,
+            .salt = nonce,
+            .salt_size = ARGON_SALT_SIZE
+        };
+        err = gen_key(gen_key_config, inputs, gen_key_extras, KEY_SIZE, pkey);
         if (err != ERR_OK) {
             BAIL(err);
         }
         // Encrypt the given key using the generated key.
-        crypto_aead_lock(fkey, mac, prot_key, nonce, NULL, 0, key, KEY_SIZE);
+        crypto_aead_lock(fkey, mac, pkey, nonce, NULL, 0, key, KEY_SIZE);
     }
     // Write the key (content) into kf.
     if (write_bytes(kf, content, KEYFILE_SIZE) != KEYFILE_SIZE) {
@@ -513,12 +551,12 @@ static enum error write_keyfile(FILE *kf, uint8_t key[KEY_SIZE])
     }
 bail:
     crypto_wipe(passphrase, sizeof(passphrase));
-    crypto_wipe(prot_key, sizeof(prot_key));
+    crypto_wipe(pkey, sizeof(pkey));
     return err;
 }
 
 // Print the usage message.
-static void print_usage()
+static void print_usage(void)
 {
     const char **s = usage;
     while (*s) {
@@ -528,7 +566,7 @@ static void print_usage()
 }
 
 // Print the version information.
-static void print_version()
+static void print_version(void)
 {
     fputs(PROG " " PROG_VERSION "\n", stdout);
 }
@@ -558,6 +596,8 @@ int main(int argc, char *argv[])
     uint8_t uid_hash[ARGON_SALT_SIZE]; // User ID hash to be used as a salt.
     int pwlen = 0; // passphrase length
     int uilen = 0; //uid length
+    crypto_argon2_config gk_config = gen_key_config;
+    crypto_argon2_extras gk_extras = gen_key_extras;
 
     char *keyfile = NULL;
     char *infile = NULL;
@@ -569,12 +609,13 @@ int main(int argc, char *argv[])
     enum error err = ERR_OK;
     int exitcode = 0;
 
+    int stop = 0;
     int option;
     struct optparse options;
 
     (void)argc;
     optparse_init(&options, argv);
-    while ((option = optparse_long(&options, longopts, NULL)) != -1) {
+    while (!stop && (option = optparse_long(&options, longopts, NULL)) != -1) {
         switch (option) {
             case 'g':
                 mode = MODE_KEYGEN;
@@ -613,14 +654,26 @@ int main(int argc, char *argv[])
                 }
                 break;
             case 'V':
-                print_version();
-                BAIL(ERR_OK);
+                mode = MODE_VERSION;
+                stop = 1;
+                break;
             case '?':
+                BAIL(ERR_USAGE);
+                break;
             case 'h':
             default:
-                print_usage();
-                BAIL(ERR_OK);
+                mode = MODE_USAGE;
+                stop = 1;
+                break;
         }
+    }
+
+    // If the mode doesn't use keyfile and use_passphrase, reset them.
+    if (mode & (MODE_NONE | MODE_VERSION | MODE_USAGE)) {
+        keyfile = NULL;
+        use_passphrase = 0;
+        // If no mode of usage has been chosen, set mode to MODE_USAGE.
+        mode = (mode == MODE_NONE) ? MODE_USAGE : mode;
     }
 
     // What are we using?  A keyfile or a passphrase?
@@ -635,26 +688,26 @@ int main(int argc, char *argv[])
         if (err != ERR_OK) {
             BAIL(err);
         }
-    } else if (!pwlen && (mode != MODE_KEYGEN)) {
-        print_usage();
-        BAIL(ERR_OK);
+    } else if (!use_passphrase && (mode & (MODE_ENCRYPT | MODE_DECRYPT))) {
+        mode = MODE_USAGE;
     }
 
     // Set the standard input and output to binary mode (_WIN32)
     binary_stdio();
 
     // Open the input file.
-    // infile is not needed for MODE_KEYGEN.
-    if (mode != MODE_KEYGEN && mode != MODE_KEYEDIT) {
+    // infile is only needed for encryption and decryption.
+    if (mode & (MODE_ENCRYPT | MODE_DECRYPT)) {
         infile =  optparse_arg(&options);
         in = !infile || !strcmp(infile, "-") ? stdin : fopen(infile, "rb");
-        if (!in && (mode != MODE_KEYGEN)) {
+        if (!in) {
             BAIL(ERR_INPUT_FILE);
         }
     }
 
     // Open the output file.
-    if (mode != MODE_KEYEDIT) {
+    // outfile is needed for encryption, decryption, and keygen.
+    if (mode & (MODE_ENCRYPT | MODE_DECRYPT | MODE_KEYGEN)) {
         outfile =  optparse_arg(&options);
         out = !outfile ? stdout : fopen(outfile, "wb");
         if (!out) {
@@ -675,7 +728,13 @@ int main(int argc, char *argv[])
                 // Hash the uid to use it as a salt for key derivation.
                 crypto_blake2b(uid_hash, ARGON_SALT_SIZE, uid, uilen);
                 // Generate a key using the passphrase and this salt.
-                err = gen_key(passphrase, pwlen, uid_hash, key);
+                crypto_argon2_inputs inputs = {
+                    .pass = passphrase,
+                    .pass_size = pwlen,
+                    .salt = uid_hash,
+                    .salt_size = ARGON_SALT_SIZE
+                };
+                err = gen_key(gk_config, inputs, gk_extras, KEY_SIZE, key);
                 if (err != ERR_OK) {
                     BAIL(err);
                 }
@@ -691,8 +750,8 @@ int main(int argc, char *argv[])
             // If the key has a passphrase, by editing it, we can change or
             // remove the passphrase. If does not, we can add a protection
             // passphrase.
-            fclose(kf); // close the keyfile, and reopen it in write mode.
-            if (!(kf = fopen(keyfile, "wb"))) {
+            // Reopen keyfile in read/write mode.
+            if (!(kf = freopen(keyfile, "rb+", kf))) {
                BAIL(ERR_KEYFILE);
             }
             err = write_keyfile(kf, key);
@@ -712,7 +771,13 @@ int main(int argc, char *argv[])
             // If passphrase-based encryption, generate a key from the
             // passphrase and the first ARGON_SALT_SIZE bytes in the header.
             if (use_passphrase) {
-                err = gen_key(passphrase, pwlen, header, key);
+                crypto_argon2_inputs inputs = {
+                    .pass = passphrase,
+                    .pass_size = pwlen,
+                    .salt = header,
+                    .salt_size = ARGON_SALT_SIZE
+                };
+                err = gen_key(gk_config, inputs, gk_extras, KEY_SIZE, key);
                 if (err != ERR_OK) {
                     BAIL(err);
                 }
@@ -739,7 +804,13 @@ int main(int argc, char *argv[])
             // If passphrase-based decryption, generate a key from the
             // passphrase and the first ARGON_SALT_SIZE bytes in the header.
             if (use_passphrase) {
-                err = gen_key(passphrase, pwlen, header, key);
+                crypto_argon2_inputs inputs = {
+                    .pass = passphrase,
+                    .pass_size = pwlen,
+                    .salt = header,
+                    .salt_size = ARGON_SALT_SIZE
+                };
+                err = gen_key(gk_config, inputs, gk_extras, KEY_SIZE, key);
                 if (err != ERR_OK) {
                     BAIL(err);
                 }
@@ -750,9 +821,12 @@ int main(int argc, char *argv[])
                 BAIL(err);
             }
             break;
+        case MODE_VERSION:
+            print_version();
+            break;
         case MODE_NONE:
+        case MODE_USAGE:
             print_usage();
-            BAIL(ERR_OK);
     }
 
 // Clean everything and exit.
@@ -770,8 +844,12 @@ bail:
 
     // Display error message if any.
     if (err != ERR_OK) {
-        fprintf(stderr, "%s: %s\n", PROG, errmsg[err]);
-        exitcode = 1;
+        if (err == ERR_USAGE) { // display Optparse's errormsg first.
+            fprintf(stderr, "%s: %s. %s\n", PROG, options.errmsg, errmsg[err]);
+        } else {
+            fprintf(stderr, "%s: %s\n", PROG, errmsg[err]);
+        }
+        exitcode = err;
     }
 
     return exitcode;
