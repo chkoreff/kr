@@ -23,7 +23,6 @@ install: kr kr.1
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
 	mkdir -p $(DESTDIR)$(PREFIX)/share/man/man1
 	install -m 755 kr $(DESTDIR)$(PREFIX)/bin
-	mkdir -p $(DESTDIR)$(PREFIX)/share/man/man1
 	gzip < kr.1 > $(DESTDIR)$(PREFIX)/share/man/man1/kr.1.gz
 
 uninstall:
